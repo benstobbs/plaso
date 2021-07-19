@@ -3,6 +3,7 @@
 
 import logging
 import os
+import threading
 
 from dfdatetime import posix_time as dfdatetime_posix_time
 from dfvfs.serializer.json_serializer import JsonPathSpecSerializer
@@ -140,6 +141,8 @@ class SharedElasticsearchOutputModule(interface.OutputModule):
 
   _DEFAULT_FLUSH_INTERVAL = 1000
 
+  _DEFAULT_FLUSH_THREADS = 10
+
   # Number of seconds to wait before a request to Elasticsearch is timed out.
   _DEFAULT_REQUEST_TIMEOUT = 300
 
@@ -177,6 +180,7 @@ class SharedElasticsearchOutputModule(interface.OutputModule):
     self._use_ssl = None
     self._ca_certs = None
     self._url_prefix = None
+    self._flush_threads = []
 
   def _Connect(self):
     """Connects to an Elasticsearch server.
@@ -230,24 +234,19 @@ class SharedElasticsearchOutputModule(interface.OutputModule):
 
   def _FlushEvents(self):
     """Inserts the buffered event documents into Elasticsearch."""
-    try:
-      # pylint: disable=unexpected-keyword-arg
-      bulk_arguments = {
-          'body': self._event_documents,
-          'index': self._index_name,
-          'request_timeout': self._DEFAULT_REQUEST_TIMEOUT}
+    while len(self._flush_threads) >= self._DEFAULT_FLUSH_THREADS:
+      self._flush_threads = [t for t in self._flush_threads if t.is_alive()]
 
-      self._client.bulk(**bulk_arguments)
+    newThread = FlushThread(
+      self._event_documents,
+      self._index_name,
+      self._DEFAULT_REQUEST_TIMEOUT,
+      self._number_of_buffered_events,
+      self._client)
 
-    except (
-        ValueError,
-        elasticsearch.exceptions.ElasticsearchException) as exception:
-      # Ignore problematic events
-      logger.warning('Unable to bulk insert with error: {0!s}'.format(
-          exception))
+    newThread.start()
 
-    logger.debug('Inserted {0:d} events into Elasticsearch'.format(
-        self._number_of_buffered_events))
+    self._flush_threads.append(newThread)
 
     self._event_documents = []
     self._number_of_buffered_events = 0
@@ -358,6 +357,9 @@ class SharedElasticsearchOutputModule(interface.OutputModule):
     Inserts any remaining buffered event documents.
     """
     self._FlushEvents()
+
+    for t in self._flush_threads:
+      t.join()
 
     self._client = None
 
@@ -474,3 +476,32 @@ class SharedElasticsearchOutputModule(interface.OutputModule):
       event_tag (EventTag): event tag.
     """
     self._InsertEvent(event, event_data, event_data_stream, event_tag)
+
+class FlushThread(threading.Thread):
+    def __init__(self, event_documents, index_name, request_timeout, number_of_buffered_events, client):
+      threading.Thread.__init__(self)
+      self.event_documents = event_documents
+      self.index_name = index_name
+      self.request_timeout = request_timeout
+      self.number_of_buffered_events = number_of_buffered_events
+      self.client = client
+    
+    def run(self):
+      try:
+        # pylint: disable=unexpected-keyword-arg
+        bulk_arguments = {
+            'body': self.event_documents,
+            'index': self.index_name,
+            'request_timeout': self.request_timeout}
+
+        self.client.bulk(**bulk_arguments)
+
+      except (
+          ValueError,
+          elasticsearch.exceptions.ElasticsearchException) as exception:
+        # Ignore problematic events
+        logger.warning('Unable to bulk insert with error: {0!s}'.format(
+            exception))
+
+      logger.debug('Inserted {0:d} events into Elasticsearch'.format(
+          self.number_of_buffered_events))
